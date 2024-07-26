@@ -1,10 +1,9 @@
 # %% [markdown]
-# # Captum Insights for Visual Question Answering
+# # Captum Insights for Visual Question Answering with Added Evaluation of Models
 
 # %% [markdown]
 # This notebook provides a simple example for the [Captum Insights API](https://captum.ai/docs/captum_insights), which is an easy to use API built on top of Captum that provides a visualization widget.
 # 
-# It is suggested to first read the multi-modal [tutorial](https://captum.ai/tutorials/Multimodal_VQA_Interpret) with VQA that utilises the `captum.attr` API. This tutorial will skip over a large chunk of details for setting up the VQA model.
 # 
 # As with the referenced tutorial, you will need the following installed on your machine:
 # 
@@ -12,6 +11,7 @@
 # - pytorch-vqa: https://github.com/Cyanogenoid/pytorch-vqa
 # - pytorch-resnet: https://github.com/Cyanogenoid/pytorch-resnet
 # - A pretrained pytorch-vqa model, which can be obtained from: https://github.com/Cyanogenoid/pytorch-vqa/releases/download/v1.0/2017-08-04_00.55.19.pth
+# - Create a CUDA environment with environment.yml do all dependencies and versions are correct and working
 # 
 # Please modify the below section for your specific installation paths:
 
@@ -36,7 +36,7 @@ sys.path.append(PYTORCH_VQA_DIR)
 sys.path.append(PYTORCH_RESNET_DIR)
 
 # %% [markdown]
-# Now, we will import the necessary modules to run the code in this tutorial. Please make sure you have the [prerequisites to run captum](https://captum.ai/docs/getting_started), along with the pre-requisites to run this tutorial (as described in the first section).
+# Now, we will import the necessary modules to run the code. Please make sure you have the [prerequisites to run captum](https://captum.ai/docs/getting_started), along with the pre-requisites to run this tutorial (as described in the first section).
 
 # %%
 import numpy as np
@@ -65,7 +65,7 @@ from captum.insights.attr_vis.features import ImageFeature, TextFeature
 from captum.attr import TokenReferenceBase, configure_interpretable_embedding_layer, remove_interpretable_embedding_layer
 
 # %%
-run_on='cuda'  # change to 'cuda' if a GPU is available
+run_on='cpu'  # change to 'cuda' if a GPU is available
 if run_on == 'cuda':
     # Let's set the device we will use for model inference
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -299,12 +299,12 @@ def itos(input):
 # Let's define some dummy data to visualize using the function we declared earlier.
 
 # %%
-dataset = vqa_dataset("./img/vqa/elephant.jpg", 
+dataset = vqa_dataset("./img/vqa/siamese.jpg", 
     ["what is on the picture",
-    "what color is the elephant",
-    "where is the elephant" ],
-    ["elephant", "gray", "zoo"]
-)
+    "what color is the cat",
+    "where color are the cat eyes" ],
+    ["cat", "white and brown", "blue"]
+)    
 
 # %% [markdown]
 # Now let's describe our features. Each feature requires an input transformation function and a set of baselines. As described earlier, we will use the black image for the image baseline and a padded sequence for the text baseline.
@@ -340,19 +340,16 @@ import numpy as np
 import random
 from nltk.corpus import wordnet
 from itertools import chain
+import nltk
+nltk.download('wordnet')
+nltk.download('omw-1.4')
 
-def perturb_image(image, noise_level=0.1):
-    """
-    Apply random noise to the image.
-    
-    :param image: PIL Image or tensor
-    :param noise_level: float, the standard deviation of the noise
-    :return: perturbed image as tensor
-    """
+
+def perturb_image(image, noise_level=0.1, device='cpu'):
     if isinstance(image, Image.Image):
-        image = transforms.ToTensor()(image)
+        image = transforms.ToTensor()(image).to(device)
     
-    noise = torch.randn(image.size()) * noise_level
+    noise = torch.randn(image.size(), device=device) * noise_level
     perturbed_image = image + noise
     perturbed_image = torch.clamp(perturbed_image, 0, 1)  # Ensure pixel values are within [0, 1]
     
@@ -363,13 +360,7 @@ def get_synonyms(word):
     return set(chain.from_iterable([word.lemma_names() for word in synonyms]))
 
 def perturb_text(text, perturbation_rate=0.1):
-    """
-    Replace words in the text with their synonyms.
-    
-    :param text: str, input text
-    :param perturbation_rate: float, percentage of words to be replaced
-    :return: perturbed text
-    """
+
     words = text.split()
     num_perturb = int(len(words) * perturbation_rate)
     indices = random.sample(range(len(words)), num_perturb)
@@ -382,88 +373,101 @@ def perturb_text(text, perturbation_rate=0.1):
     perturbed_text = ' '.join(words)
     return perturbed_text
 
-# Example usage for image
-image = Image.open("path/to/your/image.jpg")
-perturbed_image = perturb_image(image, noise_level=0.1)
-transforms.ToPILImage()(perturbed_image).show()
-
-# Example usage for text
-text = "This is an example text for perturbation."
-perturbed_text = perturb_text(text, perturbation_rate=0.2)
-print(perturbed_text)
-
-
-# %% [markdown]
-# Here, all the different functions for evaluating models on the multimodal dataset is coded.
 
 # %%
-from scipy.stats import spearmanr
-from textstat import flesch_kincaid_grade
 import torch
-from captum.attr import IntegratedGradients
+
+import torch
+
+def calculate_aopc_comprehensiveness(model, transformed_inputs, target, attributions, additional_args, steps=5):
+    device = next(model.parameters()).device
+    original_pred = model(*transformed_inputs, additional_args).max(dim=1).values
+    
+    scores = torch.zeros(steps, len(original_pred), device='cpu')
+    
+    for k in range(1, steps + 1):
+        perturbed_inputs = []
+        for i, input_tensor in enumerate(transformed_inputs):
+            # Flatten the attribution tensor and get top k indices
+            top_k_indices = attributions[i].view(-1).argsort(descending=True)[:k]
+            # Clone the input tensor to avoid modifying the original tensor
+            perturbed_input = input_tensor.clone()
+            # Flatten the tensor, set top k indices to 0, and reshape back to original shape
+            perturbed_input.view(-1)[top_k_indices] = 0
+            perturbed_inputs.append(perturbed_input)
+        
+        # Move perturbed inputs to the original device of the model (usually GPU)
+        perturbed_inputs = [pi.to(device) for pi in perturbed_inputs]
+        
+        # Compute perturbed predictions
+        perturbed_pred = model(*perturbed_inputs, additional_args).max(dim=1).values
+        scores[k-1] = (original_pred - perturbed_pred).cpu()  # Move to CPU to free GPU memory
+        
+        # Clear CUDA cache to free up memory
+        torch.cuda.empty_cache()
+    
+    return scores.mean(dim=0).item()
 
 
-# Evaluation functions
-def feature_importance_consistency(attributions, model_weights):
-    # Summarize attributions to match the dimensionality of model weights
-    summarized_attributions = torch.mean(torch.tensor(attributions), dim=0).detach().cpu().numpy()
-    weights = model_weights.detach().cpu().numpy()
-    return spearmanr(summarized_attributions, weights[:len(summarized_attributions)]).correlation
 
-def perturbation_test(attributions, inputs, model, additional_args, perturbation_factor=0.1):
-    perturbed_inputs = []
-    for input in inputs:
-        perturbed_input = []
-        for element in input:
-            if isinstance(element, torch.Tensor):
-                perturbed_input.append(element.clone())
-            else:
-                perturbed_input.append(element)
-        perturbed_inputs.append(perturbed_input)
+import torch
 
-    # Get the device of the inputs
-    device = inputs[0][0].device
-
-    # Convert attributions to tensors and move them to the same device as inputs
-    image_attributions = torch.tensor([attr[0] for attr in attributions]).to(device)
-    text_attributions = torch.tensor([attr[1] for attr in attributions]).to(device)
-
-    # Debug prints
-    print(f"Image attributions shape: {image_attributions.shape}")
-    print(f"Text attributions shape: {text_attributions.shape}")
-
-    # Ensure image_attributions matches the shape of the image input
-    for i in range(len(perturbed_inputs)):
-        batch_size, channels, height, width = perturbed_inputs[i][0].shape
-        print(f"Perturbed input shape: {perturbed_inputs[i][0].shape}")
-        image_perturbation = image_attributions.view(batch_size, channels, height, width) * perturbation_factor
-        perturbed_inputs[i][0] += image_perturbation
-
-        # Ensure text_attributions matches the shape of the question input
-        sequence_length = perturbed_inputs[i][1].shape[1]
-        text_perturbation = text_attributions.view(batch_size, sequence_length) * perturbation_factor
-        perturbed_inputs[i][1] += text_perturbation
-
-    original_output = model(*inputs, additional_args)
-    perturbed_output = model(*[tuple(input) for input in perturbed_inputs], additional_args)
-    return torch.norm(original_output - perturbed_output).item()
+def calculate_aopc_sufficiency(model, transformed_inputs, target, attributions, additional_args, steps=5):
+    device = next(model.parameters()).device
+    original_pred = model(*transformed_inputs, additional_args).max(dim=1).values
+    
+    scores = torch.zeros(steps, len(original_pred), device='cpu')
+    
+    for k in range(1, steps + 1):
+        perturbed_inputs = []
+        for i, input_tensor in enumerate(transformed_inputs):
+            # Flatten the attribution tensor and get top k indices
+            top_k_indices = attributions[i].view(-1).argsort(descending=True)[:k]
+            # Create a mask with top k indices set to 0
+            mask = torch.ones_like(input_tensor).view(-1)
+            mask[top_k_indices] = 0
+            # Clone the input tensor and apply the mask
+            perturbed_input = input_tensor.clone()
+            perturbed_input.view(-1)[mask.bool()] = 0
+            perturbed_inputs.append(perturbed_input)
+        
+        # Move perturbed inputs to the original device of the model (usually GPU)
+        perturbed_inputs = [pi.to(device) for pi in perturbed_inputs]
+        
+        # Compute perturbed predictions
+        perturbed_pred = model(*perturbed_inputs, additional_args).max(dim=1).values
+        scores[k-1] = perturbed_pred.cpu()  # Move to CPU to free GPU memory
+        
+        # Clear CUDA cache to free up memory
+        torch.cuda.empty_cache()
+    
+    return scores.mean(dim=0).item()
 
 
-def readability_score(text):
-    return flesch_kincaid_grade(text)
 
-def stability_test(attributions, inputs, model, additional_args, noise_level=0.1):
-    noisy_inputs = [input + noise_level * torch.randn_like(input) for input in inputs]
-    noisy_attributions = visualizer.attribution_calculation.calculate_attribution(
-        baselines=None,
-        data=noisy_inputs,
-        additional_forward_args=additional_args,
-        label=None,
-        attribution_method_name="IntegratedGradients",
-        attribution_arguments={'n_steps': 25},
-        model=model
-    )
-    return torch.norm(attributions - noisy_attributions).item()
+
+def evaluate_plausibility(attributions, human_rationale, threshold=0.5):
+    # Calculate binary predictions from attributions
+    binary_attributions = (attributions > threshold).float()
+    true_positive = (binary_attributions * human_rationale).sum().item()
+    false_positive = (binary_attributions * (1 - human_rationale)).sum().item()
+    false_negative = ((1 - binary_attributions) * human_rationale).sum().item()
+
+    precision = true_positive / (true_positive + false_positive)
+    recall = true_positive / (true_positive + false_negative)
+    f1_score = 2 * (precision * recall) / (precision + recall)
+
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score
+    }
+
+# # Example usage
+# human_rationale = torch.tensor([0, 1, 0, 1, 0, 0, 1])  # Example human rationale
+# plausibility_scores = evaluate_plausibility(attributions, human_rationale)
+# print(f"Plausibility Scores: {plausibility_scores}")
+
 
 # %% [markdown]
 # Let's define our AttributionVisualizer object with the above parameters and our `vqa_resnet` model. 
@@ -483,105 +487,147 @@ visualizer = AttributionVisualizer(
 # Insights allows [different attribution methods](https://captum.ai/docs/algorithms) to be chosen. By default, [integrated gradients](https://captum.ai/api/integrated_gradients) is selected.
 
 # %%
-visualizer.serve(debug=True)
+visualizer.serve()
 
 # %% [markdown]
-# Now that the visualizer is being displayed on localhost, when a explanation is run we have the requiered information to create evaluations for this models.
+# Now that the visualizer is displayed on localhost, we can run explanations and obtain the necessary information to evaluate these models. In this first section, a sensitivity test was conducted to observe how perturbations impact the explanation and to determine the magnitude of perturbation required to produce an incorrect explanation.
 
 # %%
-from captum.attr._utils.batching import _batched_generator
+from captum.attr import (Deconvolution,DeepLift,FeatureAblation,GuidedBackprop,InputXGradient,IntegratedGradients,Occlusion,Saliency,)
+import pandas as pd
+from tabulate import tabulate
 
+SUPPORTED_ATTRIBUTION_METHODS = [Deconvolution,DeepLift,GuidedBackprop,InputXGradient,IntegratedGradients,Saliency,FeatureAblation,Occlusion,]
+ATTRIBUTION_NAMES_TO_METHODS = {
+    cls.get_name(): cls  # type: ignore
+    for cls in SUPPORTED_ATTRIBUTION_METHODS
+}
+
+def calculate_attributions(model, inputs, target, baselines, additional_args, xai_model, selected_arguments):
+    xai = ATTRIBUTION_NAMES_TO_METHODS[xai_model](model)
+    if xai_model in ['IntegratedGradients', 'FeatureAblation', 'Occlusion']:
+        attributions = xai.attribute.__wrapped__(xai, inputs=inputs, additional_forward_args=additional_args, target=target, **selected_arguments)
+    else:
+        attributions = xai.attribute.__wrapped__(xai, inputs=inputs, additional_forward_args=additional_args, target=target)
+    return attributions
 
 modality_attributions = visualizer.get_attributions()
-# Inspect the extracted attributions
-print("Extracted Attributions:")
-for mod_attr in modality_attributions:
-    print(mod_attr)
-    
-    
-dataset = vqa_dataset("./img/vqa/elephant.jpg", 
-    ["what is on the picture",
-    "what color is the elephant",
-    "where is the elephant" ],
-    ["elephant", "gray", "zoo"]
-)    
-# inputs= []
-# labels = []
-# additional_args = []
-# for batch in dataset:
-#     inputs.append(batch.inputs)
-#     labels.append(batch.labels)
-#     additional_args.append(batch.additional_args)
-# print(labels)
+ 
+selected_arguments= visualizer.get_insights_config()['selected_arguments']    
+xai_model = visualizer.get_insights_config()['selected_method']
+print(xai_model) 
 
-#labels = torch.tensor(labels)
-# inputs= []
-# labels = []
-# additional_args = []
-# for batch in dataset:
-#     inputs.append(batch.inputs)
-#     labels.append(batch.labels)
-#     additional_args.append(batch.additional_args)
-# print(inputs)
 
-# labels = torch.tensor(labels)
-
-# batch_data = next(iter(dataset))
-# for (
-#             inputs,
-#             additional_forward_args,
-#             label,
-#         ) in _batched_generator(  # type: ignore
-#             inputs=batch_data.inputs,
-#             additional_forward_args=batch_data.additional_args,
-#             target_ind=batch_data.labels,
-#             internal_batch_size=1,  # should be 1 until we have batch label support
-#         ):
-#             print(inputs)
-#             (predicted_scores, baselines, transformed_inputs,) = visualizer.attribution_calculation.calculate_predicted_scores(inputs, additional_forward_args,ATTRIBUTION_NAMES_TO_METHODS[xai_model])  
-#             attrs_per_feature = visualizer.attribution_calculation.calculate_attribution(
-#                     baselines,
-#                     transformed_inputs,
-#                     additional_forward_args,
-#                     target,
-#                     visualizer._config.attribution_method,
-#                     visualizer._config.attribution_arguments,
-#                     ATTRIBUTION_NAMES_TO_METHODS[xai_model],
-#                 )
-#             if target is None:
-#                 target = (
-#                     predicted_scores[0].index if len(predicted_scores) > 0 else None
-#                 )
-#             net_contrib = visualizer.attribution_calculation.calculate_net_contrib(attrs_per_feature)
-
-batch_data = next(iter(dataset))
-
-(inputs,additional_forward_args,label,)=_batched_generator(  # type: ignore
-            inputs=batch_data.inputs,
-            additional_forward_args=batch_data.additional_args,
-            target_ind=batch_data.labels,
-            internal_batch_size=1,  # should be 1 until we have batch label support
-        )
-print(visualizer.get_insights_config()['selected_arguments'])
-xai_model = visualizer.get_insights_config()['selected_model']
-print(visualizer.get_insights_config()['selected_method'])
-
-(predicted_scores, baselines, transformed_inputs,) = visualizer.attribution_calculation.calculate_predicted_scores(inputs, additional_forward_args, xai_model)
-
+# %% [markdown]
+# Here is the code for calculating sensitivity by separating the picture and question, and creating individual perturbations for these inputs.
 
 # %%
-# Evaluate explanations
-model_weights = vqa_resnet.module.classifier.lin2.weight # Example for accessing model weights
-faithfulness_score = feature_importance_consistency(modality_attributions, model_weights)
-#perturbation_score = perturbation_test(attributions, inputs, vqa_resnet, additional_args)
-readability = readability_score("Generated Explanation Text")  # Replace with actual text
-#sensitivity_score = stability_test(attributions, inputs, vqa_resnet)
+dataset = vqa_dataset("./img/vqa/siamese.jpg", 
+    ["what is on the picture",
+    "what color is the cat",
+    "where color are the cat eyes" ],
+    ["cat", "white and brown", "blue"]
+)  
 
-# Print or log evaluation results
-print(f"Faithfulness Score: {faithfulness_score}")
-#print(f"Perturbation Score: {perturbation_score}")
-print(f"Readability Score: {readability}")
-#print(f"Sensitivity Score: {sensitivity_score}")
+results = []
+
+for batch in dataset:
+    original_inputs = batch.inputs
+    original_additional_args = batch.additional_args
+    target = batch.labels
+    
+    noise_level = 0.1
+    perturbation_rate = 0.1
+    
+    # Calculate original attributions
+    (original_predicted_scores, original_baselines, transformed_inputs,) = visualizer.attribution_calculation.calculate_predicted_scores(original_inputs, original_additional_args, vqa_resnet)
+    original_attributions = calculate_attributions(vqa_resnet, transformed_inputs, target, None, original_additional_args, xai_model, selected_arguments)
+    original_net_contrib = visualizer.attribution_calculation.calculate_net_contrib(original_attributions)
+
+    # Clear unused variables and cache to free GPU memory
+    del original_baselines
+    torch.cuda.empty_cache()
+    
+    original_label = original_predicted_scores[0].label
+    
+    # Ensure inputs and attributions are properly dimensioned
+    inputs_image = transformed_inputs[0].unsqueeze(0)  # Add batch dimension if needed
+    inputs_text = transformed_inputs[1].unsqueeze(0)   # Add batch dimension if needed
+    inputs = (inputs_image, inputs_text)
+
+    # AOPC Comprehensiveness
+    aopc_comprehensiveness_score = calculate_aopc_comprehensiveness(vqa_resnet, transformed_inputs, target, original_attributions, original_additional_args)
+    print(f"AOPC Comprehensiveness Score: {aopc_comprehensiveness_score}")
+
+    # AOPC Sufficiency
+    aopc_sufficiency_score = calculate_aopc_sufficiency(vqa_resnet, transformed_inputs, target, original_attributions, original_additional_args)
+    print(f"AOPC Sufficiency Score: {aopc_sufficiency_score}")
+
+    # Plausibility Evaluation
+    human_rationale_image = torch.tensor([...])  # Example human rationale for image
+    human_rationale_text = torch.tensor([...])  # Example human rationale for text
+    human_rationale = (human_rationale_image, human_rationale_text)
+    plausibility_scores = evaluate_plausibility(original_attributions, human_rationale)
+    print(f"Plausibility Scores: {plausibility_scores}")
+    
+    Sensitivity Test
+    while True:
+        # Perturb image
+        perturbed_image = perturb_image(original_inputs[0][0], noise_level=noise_level, device=run_on)
+        perturbed_image = perturbed_image.unsqueeze(0).to(device)
+
+        # Perturb text
+        original_question = ' '.join(itos(original_inputs[1][0]))
+        perturbed_question = perturb_text(original_question, perturbation_rate=perturbation_rate)
+        perturbed_question_vec, perturbed_question_len = encode_question(perturbed_question)
+        perturbed_question_vec = perturbed_question_vec.unsqueeze(0)
+        perturbed_question_len = perturbed_question_len.unsqueeze(0)
+
+        perturbed_inputs = (perturbed_image, perturbed_question_vec)
+        perturbed_additional_args = perturbed_question_len
+
+        # Calculate new attributions with perturbed inputs
+        (perturbed_predicted_scores, perturbed_baselines, perturbed_transformed_inputs,) = visualizer.attribution_calculation.calculate_predicted_scores(perturbed_inputs, perturbed_additional_args, vqa_resnet)
+        perturbed_attributions = calculate_attributions(vqa_resnet, perturbed_transformed_inputs, target, None, perturbed_additional_args, xai_model, selected_arguments)
+        perturbed_net_contrib = visualizer.attribution_calculation.calculate_net_contrib(perturbed_attributions)
+
+        # Clear unused variables and cache to free GPU memory
+        del perturbed_baselines, perturbed_transformed_inputs
+        torch.cuda.empty_cache()
+
+        # Compare original and perturbed attributions
+        perturbed_label = perturbed_predicted_scores[0].label
+        prediction_consistency = original_label == perturbed_label
+        comparison = np.array(original_net_contrib) - np.array(perturbed_net_contrib)
+
+        # Store the results
+        results.append({
+            'noise_level': noise_level,
+            'perturbation_rate': perturbation_rate,
+            'original_label': original_label,
+            'perturbed_label': perturbed_label,
+            'prediction_consistency': prediction_consistency,
+            'original_net_contrib [Picture, Question]': str(original_net_contrib),
+            'perturbed_net_contrib [Picture, Question]': str(perturbed_net_contrib),
+            'comparison [Picture, Question]': str(comparison)
+        })
+
+        # Check for consistency
+        if not prediction_consistency:
+            break
+        else:
+            noise_level += 0.2
+            perturbation_rate += 0.1
+
+# Create a DataFrame from the results
+results_df = pd.DataFrame(results)
+print('Sensitivity test results:')
+print(tabulate(results_df, headers='keys', tablefmt='psql'))
+
+del perturbed_image, original_question, perturbed_question, perturbed_question_vec, perturbed_question_len, perturbed_inputs, perturbed_additional_args
+torch.cuda.empty_cache()
+
+
 
 # %%
 # show a screenshot if using notebook non-interactively

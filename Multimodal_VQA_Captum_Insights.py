@@ -65,7 +65,7 @@ from captum.insights.attr_vis.features import ImageFeature, TextFeature
 from captum.attr import TokenReferenceBase, configure_interpretable_embedding_layer, remove_interpretable_embedding_layer
 
 # %%
-run_on='cpu'  # change to 'cuda' if a GPU is available
+run_on='cuda'  # change to 'cuda' if a GPU is available
 if run_on == 'cuda':
     # Let's set the device we will use for model inference
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -351,7 +351,7 @@ def perturb_image(image, noise_level=0.1, device='cpu'):
     
     noise = torch.randn(image.size(), device=device) * noise_level
     perturbed_image = image + noise
-    perturbed_image = torch.clamp(perturbed_image, 0, 1)  # Ensure pixel values are within [0, 1]
+    perturbed_image = torch.clamp(perturbed_image, 0, 1)  
     
     return perturbed_image
 
@@ -375,10 +375,6 @@ def perturb_text(text, perturbation_rate=0.1):
 
 
 # %%
-import torch
-
-import torch
-
 def calculate_aopc_comprehensiveness(model, transformed_inputs, target, attributions, additional_args, steps=5):
     device = next(model.parameters()).device
     original_pred = model(*transformed_inputs, additional_args).max(dim=1).values
@@ -395,15 +391,12 @@ def calculate_aopc_comprehensiveness(model, transformed_inputs, target, attribut
             # Flatten the tensor, set top k indices to 0, and reshape back to original shape
             perturbed_input.view(-1)[top_k_indices] = 0
             perturbed_inputs.append(perturbed_input)
-        
-        # Move perturbed inputs to the original device of the model (usually GPU)
+
         perturbed_inputs = [pi.to(device) for pi in perturbed_inputs]
         
-        # Compute perturbed predictions
         perturbed_pred = model(*perturbed_inputs, additional_args).max(dim=1).values
-        scores[k-1] = (original_pred - perturbed_pred).cpu()  # Move to CPU to free GPU memory
-        
-        # Clear CUDA cache to free up memory
+        scores[k-1] = (original_pred - perturbed_pred).cpu() 
+
         torch.cuda.empty_cache()
     
     return scores.mean(dim=0).item()
@@ -430,32 +423,58 @@ def calculate_aopc_sufficiency(model, transformed_inputs, target, attributions, 
             perturbed_input = input_tensor.clone()
             perturbed_input.view(-1)[mask.bool()] = 0
             perturbed_inputs.append(perturbed_input)
-        
-        # Move perturbed inputs to the original device of the model (usually GPU)
+
         perturbed_inputs = [pi.to(device) for pi in perturbed_inputs]
-        
-        # Compute perturbed predictions
+
         perturbed_pred = model(*perturbed_inputs, additional_args).max(dim=1).values
-        scores[k-1] = perturbed_pred.cpu()  # Move to CPU to free GPU memory
+        scores[k-1] = perturbed_pred.cpu() 
         
-        # Clear CUDA cache to free up memory
         torch.cuda.empty_cache()
     
     return scores.mean(dim=0).item()
 
 
+def create_human_rationale_image(image_shape, important_regions, Test=True):
+    if Test:
+        human_rationale_image = torch.ones(image_shape)
+    else:    
+         human_rationale_image = torch.zeros(image_shape)
+         for box in important_regions:
+            x_start, x_end, y_start, y_end = box
+            human_rationale_image[:, x_start:x_end, y_start:y_end] = 1
+
+    return human_rationale_image
 
 
 def evaluate_plausibility(attributions, human_rationale, threshold=0.5):
-    # Calculate binary predictions from attributions
-    binary_attributions = (attributions > threshold).float()
-    true_positive = (binary_attributions * human_rationale).sum().item()
-    false_positive = (binary_attributions * (1 - human_rationale)).sum().item()
-    false_negative = ((1 - binary_attributions) * human_rationale).sum().item()
+    total_true_positive = 0
+    total_false_positive = 0
+    total_false_negative = 0
 
-    precision = true_positive / (true_positive + false_positive)
-    recall = true_positive / (true_positive + false_negative)
-    f1_score = 2 * (precision * recall) / (precision + recall)
+    device = attributions[0].device
+    human_rationale = [rationale.to(device) for rationale in human_rationale]
+
+    for i, (attribution, rationale) in enumerate(zip(attributions, human_rationale)):
+            
+        if attribution.shape != rationale.shape:
+            # Adjust shapes to match
+            if len(rationale.shape) < len(attribution.shape):
+                rationale = rationale.unsqueeze(0)  # Add batch dimension
+            if rationale.shape[-1] != attribution.shape[-1]:
+                rationale = rationale.unsqueeze(-1).expand_as(attribution)  # Match the last dimension
+
+        binary_attributions = (attribution > threshold).float()
+        true_positive = (binary_attributions * rationale).sum().item()
+        false_positive = (binary_attributions * (1 - rationale)).sum().item()
+        false_negative = ((1 - binary_attributions) * rationale).sum().item()
+
+        total_true_positive += true_positive
+        total_false_positive += false_positive
+        total_false_negative += false_negative
+
+    precision = total_true_positive / (total_true_positive + total_false_positive) if (total_true_positive + total_false_positive) != 0 else 0
+    recall = total_true_positive / (total_true_positive + total_false_negative) if (total_true_positive + total_false_negative) != 0 else 0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) != 0 else 0
 
     return {
         'precision': precision,
@@ -463,10 +482,11 @@ def evaluate_plausibility(attributions, human_rationale, threshold=0.5):
         'f1_score': f1_score
     }
 
-# # Example usage
-# human_rationale = torch.tensor([0, 1, 0, 1, 0, 0, 1])  # Example human rationale
-# plausibility_scores = evaluate_plausibility(attributions, human_rationale)
-# print(f"Plausibility Scores: {plausibility_scores}")
+
+
+
+
+
 
 
 # %% [markdown]
@@ -525,11 +545,17 @@ print(xai_model)
 dataset = vqa_dataset("./img/vqa/siamese.jpg", 
     ["what is on the picture",
     "what color is the cat",
-    "where color are the cat eyes" ],
+    "what color are the cat eyes" ],
     ["cat", "white and brown", "blue"]
 )  
 
+human_rationale_text = (torch.tensor([0,0,0,0,1]), torch.tensor([0,1,0,0,1]), torch.tensor([0,1,0,0,1,1]))  # Example human rationale for image
+
+
 results = []
+cont = 0
+
+
 
 for batch in dataset:
     original_inputs = batch.inputs
@@ -564,13 +590,17 @@ for batch in dataset:
     print(f"AOPC Sufficiency Score: {aopc_sufficiency_score}")
 
     # Plausibility Evaluation
-    human_rationale_image = torch.tensor([...])  # Example human rationale for image
-    human_rationale_text = torch.tensor([...])  # Example human rationale for text
-    human_rationale = (human_rationale_image, human_rationale_text)
+    #This plausibility checks needs to be done for each image and text pair in the dataset with the human rationale. For this example we dont know the regions of the images that have the highest importance, so we will use the entire image as the human rationale.
+
+    important_region = [(87, 137, 87, 137), (50, 100, 50, 100)]  # Example important region (center 50x50 region) (NOT USED IN THIS EXAMPLE) 
+    image_shape = original_inputs[0].shape[1:]  # Example image shape (C, H, W)
+    human_rationale_image = create_human_rationale_image(image_shape, important_region)
+    human_rationale = (human_rationale_image, human_rationale_text[cont])
     plausibility_scores = evaluate_plausibility(original_attributions, human_rationale)
     print(f"Plausibility Scores: {plausibility_scores}")
+    cont += 1
     
-    Sensitivity Test
+    #Sensitivity Test
     while True:
         # Perturb image
         perturbed_image = perturb_image(original_inputs[0][0], noise_level=noise_level, device=run_on)
